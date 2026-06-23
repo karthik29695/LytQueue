@@ -1,27 +1,25 @@
 """
 Worker node: polls Redis queues in priority order, executes jobs,
-handles retries, and routes exhausted jobs to the Dead Letter Queue.
+handles retries, sends heartbeats, and persists state to MySQL.
 """
-import sys
 import os
+import sys
 import time
 import uuid
 import signal
 import logging
+import threading
 from datetime import datetime, timezone
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
 from concurrent.futures import ThreadPoolExecutor
 
-# Ensure project root is on the path when running directly
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import (
     QUEUE_HIGH, QUEUE_MEDIUM, QUEUE_LOW, QUEUE_DLQ,
     MAX_RETRIES, WORKER_POLL_INTERVAL,
 )
-from core import store, queue
+from core import queue
+from core import db
 from worker.job_handlers import execute_job
 
 logging.basicConfig(
@@ -31,8 +29,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("worker")
 
-# Priority order: high is checked first
 QUEUE_PRIORITY_ORDER = [QUEUE_HIGH, QUEUE_MEDIUM, QUEUE_LOW]
+HEARTBEAT_INTERVAL = 5  # seconds
+
+
+def utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class Worker:
@@ -41,91 +43,110 @@ class Worker:
         self.threads = threads
         self.running = False
         self.executor = ThreadPoolExecutor(max_workers=threads)
+        self._active_jobs: set[str] = set()
+        self._lock = threading.Lock()
         logger.info(f"Worker {self.worker_id} initialised ({threads} thread(s))")
 
     def start(self):
         self.running = True
-        logger.info(f"Worker {self.worker_id} started — polling queues {QUEUE_PRIORITY_ORDER}")
+
+        # Register in MySQL
+        db.init_schema()
+        db.register_worker(self.worker_id)
+
+        # Start heartbeat thread
+        hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        hb_thread.start()
+
+        logger.info(f"Worker {self.worker_id} started — polling {QUEUE_PRIORITY_ORDER}")
         try:
             while self.running:
                 result = queue.pop_job(QUEUE_PRIORITY_ORDER, timeout=2)
                 if result is None:
-                    continue  # nothing in queue, loop again
+                    continue
                 q_name, job_data = result
-                # Submit to thread pool so we can keep polling
                 self.executor.submit(self._process_job, job_data, q_name)
         except KeyboardInterrupt:
             logger.info(f"Worker {self.worker_id} shutting down...")
         finally:
+            self.running = False
             self.executor.shutdown(wait=True)
-            logger.info(f"Worker {self.worker_id} stopped.")
+            db.mark_worker_offline(self.worker_id)
+            logger.info(f"Worker {self.worker_id} offline.")
 
     def stop(self):
         self.running = False
+
+    def _heartbeat_loop(self):
+        while self.running:
+            try:
+                with self._lock:
+                    active = list(self._active_jobs)
+                status = "RUNNING" if active else "IDLE"
+                current_job = active[0] if active else None
+                db.heartbeat(self.worker_id, status, current_job)
+            except Exception as e:
+                logger.warning(f"Heartbeat failed: {e}")
+            time.sleep(HEARTBEAT_INTERVAL)
 
     def _process_job(self, job_data: dict, queue_name: str):
         job_id = job_data["id"]
         job_type = job_data["type"]
         retry_count = job_data.get("retry_count", 0)
 
-        logger.info(f"[{self.worker_id}] Picked up job {job_id} (type={job_type}, retry={retry_count}, queue={queue_name})")
+        with self._lock:
+            self._active_jobs.add(job_id)
 
-        # Mark as RUNNING
-        store.update_job(
-            job_id,
-            status="RUNNING",
-            started_at=utcnow(),
-            worker_id=self.worker_id,
-        )
+        logger.info(f"[{self.worker_id}] Picked up job {job_id} "
+                    f"(type={job_type}, retry={retry_count}, queue={queue_name})")
+
+        db.update_job(job_id, status="RUNNING",
+                      started_at=utcnow(), worker_id=self.worker_id)
+        db.add_log(job_id, f"Picked up by {self.worker_id} from {queue_name}")
 
         try:
             result = execute_job(job_type, job_data.get("payload", {}))
-            # SUCCESS
-            store.update_job(
-                job_id,
-                status="COMPLETED",
-                completed_at=utcnow(),
-                error=None,
-            )
+
+            db.update_job(job_id, status="COMPLETED", completed_at=utcnow(), error=None)
+            db.increment_jobs_processed(self.worker_id)
+            db.add_log(job_id, f"COMPLETED: {result}")
             logger.info(f"[{self.worker_id}] ✓ Job {job_id} COMPLETED — {result}")
 
         except Exception as exc:
             error_msg = str(exc)
-            new_retry_count = retry_count + 1
-            logger.warning(f"[{self.worker_id}] ✗ Job {job_id} FAILED (attempt {new_retry_count}/{MAX_RETRIES}) — {error_msg}")
+            new_retry = retry_count + 1
+            logger.warning(f"[{self.worker_id}] ✗ Job {job_id} FAILED "
+                           f"(attempt {new_retry}/{MAX_RETRIES}) — {error_msg}")
+            db.add_log(job_id, f"FAILED attempt {new_retry}: {error_msg}")
 
-            if new_retry_count < MAX_RETRIES:
-                # Re-queue for retry
-                updated_job = store.update_job(
-                    job_id,
-                    status="QUEUED",
-                    retry_count=new_retry_count,
-                    error=error_msg,
-                    started_at=None,
-                )
-                time.sleep(2 ** new_retry_count)  # exponential backoff
-                queue.push_job(queue_name, updated_job)
-                logger.info(f"[{self.worker_id}] ↻ Job {job_id} re-queued (retry {new_retry_count})")
+            if new_retry < MAX_RETRIES:
+                backoff = 2 ** new_retry
+                updated = db.update_job(job_id, status="QUEUED",
+                                        retry_count=new_retry, error=error_msg,
+                                        started_at=None)
+                time.sleep(backoff)
+                queue.push_job(queue_name, updated)
+                db.add_log(job_id, f"Re-queued for retry {new_retry} after {backoff}s backoff")
+                logger.info(f"[{self.worker_id}] ↻ Job {job_id} re-queued (retry {new_retry})")
             else:
-                # Exhausted retries → Dead Letter Queue
-                store.update_job(
-                    job_id,
-                    status="DEAD",
-                    completed_at=utcnow(),
-                    retry_count=new_retry_count,
-                    error=error_msg,
-                )
-                job_data["retry_count"] = new_retry_count
+                db.update_job(job_id, status="DEAD", completed_at=utcnow(),
+                              retry_count=new_retry, error=error_msg)
+                job_data["retry_count"] = new_retry
                 job_data["error"] = error_msg
                 queue.push_job(QUEUE_DLQ, job_data)
-                logger.error(f"[{self.worker_id}] ✗✗ Job {job_id} moved to DLQ after {MAX_RETRIES} attempts")
+                db.add_log(job_id, f"Moved to DLQ after {MAX_RETRIES} failed attempts")
+                logger.error(f"[{self.worker_id}] ✗✗ Job {job_id} → DLQ")
+
+        finally:
+            with self._lock:
+                self._active_jobs.discard(job_id)
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--id", default=None, help="Worker ID")
-    parser.add_argument("--threads", type=int, default=2, help="Thread pool size")
+    parser.add_argument("--id", default=None)
+    parser.add_argument("--threads", type=int, default=2)
     args = parser.parse_args()
 
     worker = Worker(worker_id=args.id, threads=args.threads)
@@ -135,5 +156,4 @@ if __name__ == "__main__":
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
-
     worker.start()

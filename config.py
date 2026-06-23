@@ -13,6 +13,13 @@ QUEUE_MEDIUM = "queue:medium"
 QUEUE_LOW = "queue:low"
 QUEUE_DLQ = "queue:dlq"
 
+# MySQL config
+MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", 3306))
+MYSQL_USER = os.getenv("MYSQL_USER", "jobuser")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "jobpass123")
+MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "job_platform")
+
 # Worker config
 MAX_RETRIES = 3
 WORKER_POLL_INTERVAL = 1  # seconds
