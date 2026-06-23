@@ -102,6 +102,6 @@ All workers compete for jobs from the same Redis queues.
 ## Roadmap
 
 - [x] Phase 1 — FastAPI + Redis + single worker
-- [ ] Phase 2 — Multiple workers + MySQL persistence + Dashboard
+- [x] Phase 2 — Multiple workers + MySQL persistence + Dashboard
 - [ ] Phase 3 — Priority queues + retry + DLQ *(partly done in Phase 1)*
 - [ ] Phase 4 — Worker heartbeats + monitoring + metrics
