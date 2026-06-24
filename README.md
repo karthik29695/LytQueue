@@ -34,7 +34,7 @@ Inspired by systems such as Celery, AWS SQS, and Google Cloud Tasks, it provides
 - 📦 Horizontal Worker Scaling
 
 ---
-<div align="center">
+
 ## 🏗️ Architecture
 
 ```text
@@ -61,11 +61,10 @@ Inspired by systems such as Celery, AWS SQS, and Google Cloud Tasks, it provides
                   │
                   ▼
           Monitoring Dashboard
-</div>
 ```
 
 ---
-<div align="center">
+
 ## ✨ Features
 
 | Category | Features |
@@ -78,7 +77,7 @@ Inspired by systems such as Celery, AWS SQS, and Google Cloud Tasks, it provides
 | Scalability | Multiple Worker Nodes |
 | Persistence | MySQL Job Storage |
 | Deployment | Docker Compose |
-</div>
+
 ---
 
 ## 🔄 Job Lifecycle
