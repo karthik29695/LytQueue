@@ -9,11 +9,12 @@ def get_redis() -> redis.Redis:
     global _client
     if _client is None:
         _client = redis.Redis(
-            host=REDIS_HOST,
-            port=REDIS_PORT,
-            db=REDIS_DB,
-            decode_responses=True
-        )
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        db=REDIS_DB,
+        decode_responses=True,
+        socket_connect_timeout=5,
+    )
     return _client
 
 
