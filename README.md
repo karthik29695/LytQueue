@@ -291,8 +291,8 @@ Metrics tracked:
 - [x] Worker Heartbeats
 - [x] Crash Recovery
 - [x] Monitoring Dashboard
-- [ ] Scheduled Jobs
-- [ ] Recurring Jobs
+- [x] Scheduled Jobs
+- [x] Recurring Jobs
 - [ ] JWT Authentication
 - [ ] Auto Scaling
 - [ ] Prometheus Integration

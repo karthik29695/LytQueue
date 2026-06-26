@@ -101,13 +101,15 @@ def save_job(job: dict) -> None:
         with conn.cursor() as cursor:
             cursor.execute("""
                 INSERT INTO jobs (id, type, status, priority, payload, created_at,
-                                  started_at, completed_at, retry_count, worker_id, error)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                  started_at, completed_at, retry_count, worker_id, error,
+                                  run_at, schedule_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 job["id"], job["type"], job["status"], job["priority"],
                 json.dumps(job.get("payload", {})),
                 job["created_at"], job.get("started_at"), job.get("completed_at"),
                 job.get("retry_count", 0), job.get("worker_id"), job.get("error"),
+                job.get("run_at"), job.get("schedule_id"),
             ))
     finally:
         conn.close()
@@ -258,3 +260,189 @@ def get_logs(job_id: str) -> list[dict]:
             return rows
     finally:
         conn.close()
+
+
+# ─── Scheduling schema (Phase 5) ──────────────────────────────────────────────
+
+def init_schedule_schema():
+    """Add scheduling columns and tables. Safe to run multiple times."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cursor:
+            # Add run_at to jobs if not exists
+            cursor.execute("""
+                SELECT COUNT(*) as cnt FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME   = 'jobs'
+                  AND COLUMN_NAME  = 'run_at'
+            """)
+            if cursor.fetchone()["cnt"] == 0:
+                cursor.execute("ALTER TABLE jobs ADD COLUMN run_at DATETIME(3) NULL")
+                cursor.execute("ALTER TABLE jobs ADD COLUMN schedule_id VARCHAR(36) NULL")
+                logger.info("Added run_at and schedule_id columns to jobs")
+
+            # Recurring schedules table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS schedules (
+                    id                VARCHAR(36)   PRIMARY KEY,
+                    name              VARCHAR(100)  NOT NULL,
+                    job_type          VARCHAR(50)   NOT NULL,
+                    priority          VARCHAR(10)   NOT NULL DEFAULT 'medium',
+                    payload           JSON,
+                    cron_expression   VARCHAR(100)  NULL,
+                    interval_seconds  INT           NULL,
+                    next_run_at       DATETIME(3)   NOT NULL,
+                    last_run_at       DATETIME(3)   NULL,
+                    is_active         TINYINT(1)    NOT NULL DEFAULT 1,
+                    created_at        DATETIME(3)   NOT NULL,
+                    run_count         INT           NOT NULL DEFAULT 0
+                )
+            """)
+        logger.info("Schedule schema initialised")
+    finally:
+        conn.close()
+
+
+# ─── One-time scheduled job queries ──────────────────────────────────────────
+
+def get_due_scheduled_jobs() -> list[dict]:
+    """Return jobs that are SCHEDULED and whose run_at has passed."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT * FROM jobs
+                WHERE status = 'SCHEDULED'
+                  AND run_at <= NOW()
+                ORDER BY run_at ASC
+            """)
+            return [_fix_job(r) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def list_scheduled_jobs() -> list[dict]:
+    """Return all jobs still waiting to be scheduled (run_at in future)."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT * FROM jobs
+                WHERE status = 'SCHEDULED'
+                ORDER BY run_at ASC
+            """)
+            return [_fix_job(r) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+# ─── Recurring schedule queries ───────────────────────────────────────────────
+
+def save_schedule(schedule: dict) -> None:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO schedules
+                  (id, name, job_type, priority, payload, cron_expression,
+                   interval_seconds, next_run_at, last_run_at, is_active, created_at, run_count)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                schedule["id"], schedule["name"], schedule["job_type"],
+                schedule["priority"], json.dumps(schedule.get("payload", {})),
+                schedule.get("cron_expression"), schedule.get("interval_seconds"),
+                schedule["next_run_at"], schedule.get("last_run_at"),
+                1, schedule["created_at"], 0,
+            ))
+    finally:
+        conn.close()
+
+
+def get_schedule(schedule_id: str) -> Optional[dict]:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM schedules WHERE id = %s", (schedule_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return _fix_schedule(row)
+    finally:
+        conn.close()
+
+
+def list_schedules() -> list[dict]:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM schedules ORDER BY created_at DESC")
+            return [_fix_schedule(r) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_due_schedules() -> list[dict]:
+    """Return active recurring schedules whose next_run_at has passed."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT * FROM schedules
+                WHERE is_active = 1
+                  AND next_run_at <= NOW()
+                ORDER BY next_run_at ASC
+            """)
+            return [_fix_schedule(r) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def update_schedule(schedule_id: str, **fields) -> Optional[dict]:
+    if not fields:
+        return get_schedule(schedule_id)
+    conn = get_conn()
+    try:
+        with conn.cursor() as cursor:
+            set_clause = ", ".join(f"`{k}` = %s" for k in fields)
+            values = list(fields.values()) + [schedule_id]
+            cursor.execute(f"UPDATE schedules SET {set_clause} WHERE id = %s", values)
+    finally:
+        conn.close()
+    return get_schedule(schedule_id)
+
+
+def delete_schedule(schedule_id: str) -> bool:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM schedules WHERE id = %s", (schedule_id,))
+            return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def get_jobs_by_schedule(schedule_id: str, limit: int = 20) -> list[dict]:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT * FROM jobs WHERE schedule_id = %s
+                ORDER BY created_at DESC LIMIT %s
+            """, (schedule_id, limit))
+            return [_fix_job(r) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def _fix_schedule(s: dict) -> dict:
+    if not s:
+        return s
+    for field in ("next_run_at", "last_run_at", "created_at"):
+        if isinstance(s.get(field), datetime):
+            s[field] = s[field].isoformat()
+    if isinstance(s.get("payload"), str):
+        try:
+            s["payload"] = json.loads(s["payload"])
+        except Exception:
+            pass
+    return s
